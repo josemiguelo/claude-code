@@ -497,7 +497,20 @@ impl NamedCommand for IdeCommand {
     fn usage(&self) -> &str { "claude ide [status|connect|disconnect|open]" }
 
     fn execute_named(&self, _args: &[&str], _ctx: &CommandContext) -> CommandResult {
-        // Scan lockfile directory for running IDEs
+        // ---- Environment-based IDE detection --------------------------------
+        let env_detection = claurst_core::detect_ide();
+        let env_section = match &env_detection {
+            Some(kind) => {
+                let mut lines = vec![format!("Detected IDE: {}", kind.display_name())];
+                if let Some(cmd) = kind.extension_install_command() {
+                    lines.push(format!("To install the Claurst extension: {}", cmd));
+                }
+                lines.join("\n")
+            }
+            None => "No IDE detected. Running in standalone terminal.".to_string(),
+        };
+
+        // ---- Lockfile-based connection status --------------------------------
         let lockfile_dir = dirs::home_dir()
             .map(|h| h.join(".claude").join("ide"))
             .unwrap_or_default();
@@ -507,10 +520,9 @@ impl NamedCommand for IdeCommand {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.extension().map_or(false, |e| e == "lock") {
-                    if let Ok(content) = std::fs::read_to_string(&path) {
-                        if let Ok(info) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Ok(lock_content) = std::fs::read_to_string(&path) {
+                        if let Ok(info) = serde_json::from_str::<serde_json::Value>(&lock_content) {
                             let pid = info["pid"].as_u64().unwrap_or(0);
-                            // Check if process is alive
                             let alive = is_pid_alive(pid);
                             if alive {
                                 let ide_name = info["ideName"].as_str().unwrap_or("Unknown IDE").to_string();
@@ -533,17 +545,13 @@ impl NamedCommand for IdeCommand {
             }
         }
 
-        if ides.is_empty() {
-            CommandResult::Message(
-                "No IDE connections detected.\n\
-                 To connect an IDE, install the Claurst extension in VS Code or JetBrains.".to_string()
-            )
+        let connection_section = if ides.is_empty() {
+            "No active IDE extension connections found.".to_string()
         } else {
-            CommandResult::Message(format!(
-                "Connected IDEs:\n{}\n\nUse 'claude ide open <file>' to open a file in the IDE.",
-                ides.join("\n")
-            ))
-        }
+            format!("Connected IDEs:\n{}\n\nUse 'claude ide open <file>' to open a file in the IDE.", ides.join("\n"))
+        };
+
+        CommandResult::Message(format!("{env_section}\n\n{connection_section}"))
     }
 }
 

@@ -42,6 +42,7 @@ use tracing::debug;
 
 const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("advisor", "Set or unset the server-side advisor model"),
+    ("agent", "List available agents or show agent details"),
     ("agents", "Browse agent definitions and active agents"),
     ("changes", "Inspect changes from the current session"),
     ("clear", "Clear the conversation transcript"),
@@ -383,6 +384,9 @@ pub struct App {
     pub token_budget: Option<u32>,
     pub cost_usd: f64,
     pub model_name: String,
+    /// Whether the app has valid API credentials configured.
+    /// False = show the in-TUI provider setup dialog on startup.
+    pub has_credentials: bool,
     /// Current effort level (controls extended-thinking budget_tokens).
     pub effort_level: EffortLevel,
     /// Whether fast mode is currently active (model locked to FAST_MODE_MODEL).
@@ -611,6 +615,11 @@ pub struct App {
     /// Before showing the dialog for a bash command, the first whitespace-delimited
     /// word is checked against this set; a match silently auto-approves the request.
     pub bash_prefix_allowlist: std::collections::HashSet<String>,
+
+    // ---- Auto-update notification ----------------------------------------
+    /// If a newer version was found during background update check, this holds
+    /// the latest version string (e.g. "0.1.0"). Shown in the footer status bar.
+    pub update_available: Option<String>,
 }
 
 const SPINNER_VERBS: &[&str] = &[
@@ -700,6 +709,7 @@ impl App {
             token_budget: Self::load_token_budget(),
             cost_usd: 0.0,
             model_name,
+            has_credentials: true, // overridden by caller when no key is configured
             effort_level: EffortLevel::Normal,
             fast_mode: false,
             agent_status: Vec::new(),
@@ -818,6 +828,7 @@ impl App {
             scroll_accel: 3.0,
             scroll_last_time: None,
             bash_prefix_allowlist: std::collections::HashSet::new(),
+            update_available: None,
         }
     }
 

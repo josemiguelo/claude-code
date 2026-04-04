@@ -255,6 +255,10 @@ struct Cli {
     /// Override the API base URL for the selected provider
     #[arg(long, env = "CLAURST_API_BASE")]
     api_base: Option<String>,
+
+    /// Named agent to use (e.g., build, plan, explore)
+    #[arg(long, short = 'A')]
+    agent: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -344,6 +348,11 @@ async fn main() -> anyhow::Result<()> {
         return handle_auth_command(&raw_args[2..]).await;
     }
 
+    // Fast-path: `claude acp` — start the Agent Client Protocol stdio server.
+    if raw_args.get(1).map(|s| s.as_str()) == Some("acp") {
+        return claurst_acp::run_acp_server().await;
+    }
+
     // Fast-path: `claude models` — list all available providers and models.
     if raw_args.get(1).map(|s| s.as_str()) == Some("models") {
         let registry = claurst_api::ModelRegistry::new();
@@ -431,8 +440,8 @@ async fn main() -> anyhow::Result<()> {
 
     debug!(cwd = %cwd.display(), "Starting Claurst");
 
-    // Load settings from disk
-    let settings = Settings::load().await.unwrap_or_default();
+    // Load settings from disk (hierarchical: global < project)
+    let settings = Settings::load_hierarchical(&cwd).await;
 
     // Build effective config (CLI args override settings)
     let mut config = settings.effective_config();
@@ -517,22 +526,62 @@ async fn main() -> anyhow::Result<()> {
     let is_headless = cli.print || cli.prompt.is_some();
 
     // Initialize API client.
-    // Try config/env first; fall back to saved OAuth tokens; finally prompt for login.
+    // Try config/env first; fall back to saved OAuth tokens.
+    // If no Anthropic credentials are found, check whether any other provider is
+    // configured (OpenAI, Google, Ollama, Groq, etc.) — if so, proceed without
+    // requiring Anthropic auth. Only launch the OAuth flow when Anthropic is
+    // explicitly the intended provider and no key exists at all.
+    let other_provider_configured = {
+        let active_provider = config.provider.as_deref().unwrap_or("anthropic");
+        let has_non_anthropic_env =
+            std::env::var("OPENAI_API_KEY").is_ok()
+            || std::env::var("GOOGLE_API_KEY").is_ok()
+            || std::env::var("GOOGLE_GENERATIVE_AI_API_KEY").is_ok()
+            || std::env::var("GROQ_API_KEY").is_ok()
+            || std::env::var("XAI_API_KEY").is_ok()
+            || std::env::var("MISTRAL_API_KEY").is_ok()
+            || std::env::var("OPENROUTER_API_KEY").is_ok()
+            || std::env::var("DEEPSEEK_API_KEY").is_ok()
+            || std::env::var("COHERE_API_KEY").is_ok()
+            || std::env::var("TOGETHER_API_KEY").is_ok()
+            || std::env::var("PERPLEXITY_API_KEY").is_ok()
+            || std::env::var("CEREBRAS_API_KEY").is_ok()
+            || std::env::var("DEEPINFRA_API_KEY").is_ok()
+            || std::env::var("VENICE_API_KEY").is_ok()
+            || std::env::var("DASHSCOPE_API_KEY").is_ok()
+            || std::env::var("AZURE_API_KEY").is_ok()
+            || std::env::var("GITHUB_TOKEN").is_ok()
+            || std::env::var("AWS_BEARER_TOKEN_BEDROCK").is_ok()
+            || std::env::var("AWS_ACCESS_KEY_ID").is_ok()
+            // Local providers are always available
+            || true; // Ollama/LM Studio don't require keys
+        active_provider != "anthropic" || has_non_anthropic_env
+    };
+
     let (api_key, use_bearer_auth) = match config.resolve_auth_async().await {
         Some(auth) => auth,
+        None if other_provider_configured && config.provider.as_deref().unwrap_or("anthropic") != "anthropic" => {
+            // Non-Anthropic provider selected — no Anthropic key needed.
+            (String::new(), false)
+        }
         None => {
-            // No credential found — run interactive OAuth login (non-headless) or error.
+            // No Anthropic credential found.
+
             if is_headless {
                 anyhow::bail!(
-                    "No API key found. Set ANTHROPIC_API_KEY, use --api-key, or run `claude login`."
+                    "No API key found. Options:\n\
+                     - Set ANTHROPIC_API_KEY for Anthropic\n\
+                     - Set OPENAI_API_KEY for OpenAI\n\
+                     - Set GOOGLE_API_KEY for Google Gemini\n\
+                     - Set GROQ_API_KEY for Groq (fast, free tier available)\n\
+                     - Run `claurst --provider ollama` for local models (no key needed)\n\
+                     - Run `claurst auth login` for Anthropic OAuth"
                 );
+            } else {
+                // Interactive mode: start the TUI anyway — the provider setup
+                // dialog will be shown inside the TUI, just like OpenCode does.
+                (String::new(), false)
             }
-            eprintln!("No authentication found. Starting login flow...");
-            let result = oauth_flow::run_oauth_login_flow(true)
-                .await
-                .context("Login failed")?;
-            println!("Login successful!");
-            (result.credential, result.use_bearer_auth)
         }
     };
 
@@ -673,6 +722,28 @@ async fn main() -> anyhow::Result<()> {
     // Wire in the provider registry so non-Anthropic providers can be dispatched.
     query_config.provider_registry = Some(std::sync::Arc::new(provider_registry));
 
+    // Wire in the named agent (--agent flag).
+    // Merge built-in default agents with user-defined agents (user wins on collision).
+    let tools = if let Some(ref agent_name) = cli.agent {
+        query_config.agent_name = Some(agent_name.clone());
+        let mut all_agents = claurst_core::default_agents();
+        all_agents.extend(config.agents.clone());
+        if let Some(def) = all_agents.get(agent_name) {
+            let access = def.access.clone();
+            query_config.agent_definition = Some(def.clone());
+            // Override max_turns from agent definition when specified.
+            if let Some(turns) = def.max_turns {
+                query_config.max_turns = turns;
+            }
+            filter_tools_for_agent(tools, &access)
+        } else {
+            eprintln!("Warning: unknown agent '{}'. Run /agent to see available agents.", agent_name);
+            tools
+        }
+    } else {
+        tools
+    };
+
     // Spawn the background cron scheduler (fires cron tasks at scheduled times).
     // Cancelled automatically when the process exits since we use a shared token.
     let cron_cancel = tokio_util::sync::CancellationToken::new();
@@ -706,6 +777,7 @@ async fn main() -> anyhow::Result<()> {
             cost_tracker,
             cli.resume,
             bridge_config,
+            !api_key.is_empty(),
         )
         .await
     };
@@ -745,6 +817,45 @@ fn build_tools_with_mcp(
     }
 
     Arc::new(v)
+}
+
+/// Filter the tool list based on the agent's access level.
+/// - "full"        → all tools allowed (no filtering)
+/// - "read-only"   → only ReadOnly/None permission tools and AskUserQuestion
+/// - "search-only" → only Grep, Glob, Read, WebSearch, WebFetch tools
+fn filter_tools_for_agent(
+    tools: Arc<Vec<Box<dyn claurst_tools::Tool>>>,
+    access: &str,
+) -> Arc<Vec<Box<dyn claurst_tools::Tool>>> {
+    use claurst_tools::PermissionLevel as PL;
+    match access {
+        "read-only" => {
+            // Collect names of tools that are read-only, then rebuild from all_tools
+            // (Box<dyn Tool> is not Clone so we can't directly filter-and-keep).
+            let allowed_names: Vec<String> = tools
+                .iter()
+                .filter(|t| {
+                    matches!(t.permission_level(), PL::ReadOnly | PL::None)
+                        || t.name() == "AskUserQuestion"
+                })
+                .map(|t| t.name().to_string())
+                .collect();
+            let filtered: Vec<Box<dyn claurst_tools::Tool>> = claurst_tools::all_tools()
+                .into_iter()
+                .filter(|t| allowed_names.iter().any(|n| n == t.name()))
+                .collect();
+            Arc::new(filtered)
+        }
+        "search-only" => {
+            const SEARCH_TOOLS: &[&str] = &["Grep", "Glob", "Read", "WebSearch", "WebFetch"];
+            let filtered: Vec<Box<dyn claurst_tools::Tool>> = claurst_tools::all_tools()
+                .into_iter()
+                .filter(|t| SEARCH_TOOLS.contains(&t.name()))
+                .collect();
+            Arc::new(filtered)
+        }
+        _ => tools, // "full" — allow all tools unchanged
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1012,6 +1123,7 @@ async fn run_interactive(
     cost_tracker: Arc<CostTracker>,
     resume_id: Option<String>,
     bridge_config: Option<claurst_bridge::BridgeConfig>,
+    has_credentials: bool,
 ) -> anyhow::Result<()> {
     use claurst_commands::{execute_command, CommandContext, CommandResult};
     use claurst_bridge::{BridgeOutbound, TuiBridgeEvent};
@@ -1089,6 +1201,25 @@ async fn run_interactive(
     }
 
     // Bypass permissions confirmation dialog: must be accepted before any work
+    // Mark whether valid credentials exist so the TUI can show a provider
+    // setup dialog instead of failing silently on the first message.
+    app.has_credentials = has_credentials;
+
+    // If a non-Anthropic provider is active, prefix model_name with "provider/model"
+    // so the status bar can show the provider name.
+    if let Some(ref provider) = live_config.provider {
+        if provider != "anthropic" && !app.model_name.contains('/') {
+            app.model_name = format!("{}/{}", provider, app.model_name);
+        }
+    }
+
+    // Show onboarding: provider setup if no credentials, welcome tour if first run.
+    if !has_credentials {
+        app.onboarding_dialog.show_provider_setup();
+    } else if !settings.has_completed_onboarding {
+        app.onboarding_dialog.show();
+    }
+
     // Mirror TS BypassPermissionsModeDialog.tsx startup gate
     use claurst_core::config::PermissionMode;
     if live_config.permission_mode == PermissionMode::BypassPermissions {
@@ -1223,6 +1354,14 @@ async fn run_interactive(
     // Active effort level (None = use model default / High).
     // Tracks the user's /effort selection; flows into qcfg each turn.
     let mut current_effort: Option<claurst_core::effort::EffortLevel> = None;
+
+    // Background update check: spawned once at startup; result delivered via channel.
+    let (update_tx, mut update_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
+    tokio::spawn(async move {
+        let info = claurst_core::check_for_updates().await;
+        let version = info.map(|i| i.latest_version);
+        let _ = update_tx.send(version).await;
+    });
 
     'main: loop {
         app.frame_count = app.frame_count.wrapping_add(1);
@@ -2037,6 +2176,13 @@ async fn run_interactive(
             }
         }
 
+        // Check if the background update task has reported a result.
+        if app.update_available.is_none() {
+            if let Ok(Some(version)) = update_rx.try_recv() {
+                app.update_available = Some(version);
+            }
+        }
+
         // Check if query task is done; sync messages from the task
         let task_finished = current_query
             .as_ref()
@@ -2056,8 +2202,35 @@ async fn run_interactive(
                 app.is_streaming = false;
                 app.status_message = None;
 
-                // Save session
+                // Save session to JSONL (primary storage)
                 let _ = claurst_core::history::save_session(&session).await;
+
+                // Also index into SQLite for /search support
+                {
+                    let db_path = claurst_core::config::Settings::config_dir().join("sessions.db");
+                    if let Ok(store) = claurst_core::SqliteSessionStore::open(&db_path) {
+                        let _ = store.save_session(
+                            &session.id,
+                            session.title.as_deref(),
+                            &session.model,
+                        );
+                        for msg in &session.messages {
+                            let content_str = match &msg.content {
+                                claurst_core::types::MessageContent::Text(t) => t.clone(),
+                                claurst_core::types::MessageContent::Blocks(blocks) => blocks.iter()
+                                    .filter_map(|b| if let claurst_core::types::ContentBlock::Text { text } = b { Some(text.as_str()) } else { None })
+                                    .collect::<Vec<_>>()
+                                    .join(" "),
+                            };
+                            let role = match msg.role {
+                                claurst_core::types::Role::User => "user",
+                                claurst_core::types::Role::Assistant => "assistant",
+                            };
+                            let msg_id = msg.uuid.as_deref().unwrap_or("unknown");
+                            let _ = store.save_message(&session.id, msg_id, role, &content_str, None);
+                        }
+                    }
+                }
             }
         }
 

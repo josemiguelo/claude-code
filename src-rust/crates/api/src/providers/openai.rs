@@ -15,8 +15,6 @@
 //  - ProviderCapabilities
 
 use std::pin::Pin;
-use std::sync::Arc;
-
 use async_stream::stream;
 use async_trait::async_trait;
 use claurst_core::provider_id::{ModelId, ProviderId};
@@ -72,8 +70,7 @@ impl OpenAiProvider {
     }
 
     /// Returns `true` if the model should use the Responses API instead of
-    /// Chat Completions (reserved for future use — not yet implemented here).
-    #[allow(dead_code)]
+    /// Chat Completions (gpt-5+, o3, o4-mini).
     fn use_responses_api(model: &str) -> bool {
         model.starts_with("o3")
             || model.starts_with("o4")
@@ -614,6 +611,17 @@ impl LlmProvider for OpenAiProvider {
         &self,
         request: ProviderRequest,
     ) -> Result<ProviderResponse, ProviderError> {
+        if Self::use_responses_api(&request.model) {
+            return Err(ProviderError::InvalidRequest {
+                provider: self.id.clone(),
+                message: format!(
+                    "Model '{}' requires the OpenAI Responses API which is not yet fully \
+                     implemented. Use gpt-4o or gpt-4o-mini for now, or set \
+                     OPENAI_BASE_URL to a compatible endpoint.",
+                    request.model
+                ),
+            });
+        }
         self.create_message_non_streaming(&request).await
     }
 
@@ -622,6 +630,17 @@ impl LlmProvider for OpenAiProvider {
         request: ProviderRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>
     {
+        if Self::use_responses_api(&request.model) {
+            return Err(ProviderError::InvalidRequest {
+                provider: self.id.clone(),
+                message: format!(
+                    "Model '{}' requires the OpenAI Responses API which is not yet fully \
+                     implemented. Use gpt-4o or gpt-4o-mini for now, or set \
+                     OPENAI_BASE_URL to a compatible endpoint.",
+                    request.model
+                ),
+            });
+        }
         let resp = self.do_streaming(&request).await?;
         let provider_id = self.id.clone();
 

@@ -130,6 +130,10 @@ pub fn cerebras() -> OpenAiCompatProvider {
         "https://api.cerebras.ai/v1",
     )
     .with_api_key(key)
+    .with_quirks(ProviderQuirks {
+        include_usage_in_stream: true,
+        ..Default::default()
+    })
 }
 
 /// Together AI — hosted open-source models.  Reads `TOGETHER_API_KEY`.
@@ -141,6 +145,10 @@ pub fn together_ai() -> OpenAiCompatProvider {
         "https://api.together.xyz/v1",
     )
     .with_api_key(key)
+    .with_quirks(ProviderQuirks {
+        include_usage_in_stream: true,
+        ..Default::default()
+    })
 }
 
 /// Perplexity — search-augmented LLM API.  Reads `PERPLEXITY_API_KEY`.
@@ -152,6 +160,10 @@ pub fn perplexity() -> OpenAiCompatProvider {
         "https://api.perplexity.ai",
     )
     .with_api_key(key)
+    .with_quirks(ProviderQuirks {
+        include_usage_in_stream: true,
+        ..Default::default()
+    })
 }
 
 /// Venice AI — privacy-focused inference.  Reads `VENICE_API_KEY`.
@@ -197,6 +209,7 @@ pub fn mistral() -> OpenAiCompatProvider {
         tool_id_max_len: Some(9),
         tool_id_alphanumeric_only: true,
         fix_tool_user_sequence: true,
+        include_usage_in_stream: true,
         overflow_patterns: vec!["too large for model with".to_string()],
         ..Default::default()
     })

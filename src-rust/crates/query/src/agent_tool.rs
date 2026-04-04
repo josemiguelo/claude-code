@@ -354,6 +354,8 @@ impl Tool for AgentTool {
             max_budget_usd: None,
             fallback_model: None,
             provider_registry: None,
+            agent_name: None,
+            agent_definition: None,
         };
 
         // -----------------------------------------------------------------------

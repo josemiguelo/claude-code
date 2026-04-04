@@ -454,12 +454,9 @@ pub mod client {
     impl AnthropicClient {
         /// Build a new client.  Panics if `config.api_key` is empty.
         pub fn new(config: ClientConfig) -> anyhow::Result<Self> {
-            if config.api_key.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "Anthropic API key is required. Set ANTHROPIC_API_KEY or pass --api-key."
-                ));
-            }
-
+            // Allow empty key at construction — validation is deferred to
+            // the first API call, so non-Anthropic provider setups can still
+            // create this client without an Anthropic key configured.
             let http = reqwest::Client::builder()
                 .timeout(config.request_timeout)
                 .build()?;
@@ -488,6 +485,14 @@ pub mod client {
             &self,
             mut request: CreateMessageRequest,
         ) -> Result<CreateMessageResponse, ClaudeError> {
+            // Deferred key validation — fail here rather than at construction
+            // so that non-Anthropic provider setups don't crash on startup.
+            if self.config.api_key.is_empty() && self.config.provider != Provider::Codex {
+                return Err(ClaudeError::Auth(
+                    "No Anthropic API key. Set ANTHROPIC_API_KEY, run `claurst auth login`, \
+                     or use --provider to select a different provider (e.g. --provider openai).".into()
+                ));
+            }
             // Route to Codex if configured
             if self.config.provider == Provider::Codex {
                 return self.create_message_codex(&request).await;
@@ -560,6 +565,13 @@ pub mod client {
             mut request: CreateMessageRequest,
             handler: Arc<dyn StreamHandler>,
         ) -> Result<mpsc::Receiver<streaming::AnthropicStreamEvent>, ClaudeError> {
+            // Deferred key validation
+            if self.config.api_key.is_empty() && self.config.provider != Provider::Codex {
+                return Err(ClaudeError::Auth(
+                    "No Anthropic API key. Set ANTHROPIC_API_KEY, run `claurst auth login`, \
+                     or use --provider to select a different provider (e.g. --provider openai).".into()
+                ));
+            }
             // Codex provider doesn't support streaming yet
             if self.config.provider == Provider::Codex {
                 return Err(ClaudeError::Other(

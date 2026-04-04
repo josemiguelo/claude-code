@@ -1132,7 +1132,7 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
     // --- Right column ---
     let tip_text = claurst_core::tips::select_tip(0)
         .map(|t| t.content.to_string())
-        .unwrap_or_else(|| "Run /init to create a CLAUDE.md file with instructions for Claude".to_string());
+        .unwrap_or_else(|| "Edit AGENTS.md to add instructions for Claurst".to_string());
 
     let mut right_lines: Vec<Line> = Vec::new();
     right_lines.push(Line::from(Span::styled(
@@ -1795,6 +1795,17 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                 .filter(|c| c.is_ascii_graphic() || *c == ' ')
                 .collect();
             parts.push(Span::styled(clean, Style::default().fg(Color::DarkGray)));
+        }
+
+        // 8b. Update available indicator — shown when a newer version was found.
+        if let Some(ref version) = app.update_available {
+            if !parts.is_empty() {
+                parts.push(Span::raw("  "));
+            }
+            parts.push(Span::styled(
+                format!("↑ v{} available — /upgrade", version),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ));
         }
 
         // 8. Bridge badge

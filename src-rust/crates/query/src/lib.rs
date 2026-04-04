@@ -114,6 +114,10 @@ pub struct QueryConfig {
     /// this registry contains that provider, the registry's provider is used
     /// instead of `AnthropicClient`.
     pub provider_registry: Option<std::sync::Arc<claurst_api::ProviderRegistry>>,
+    /// Active agent name (e.g., "build", "plan", "explore", or None for default).
+    pub agent_name: Option<String>,
+    /// Resolved agent definition for the current session.
+    pub agent_definition: Option<claurst_core::AgentDefinition>,
 }
 
 impl Default for QueryConfig {
@@ -136,6 +140,8 @@ impl Default for QueryConfig {
             max_budget_usd: None,
             fallback_model: None,
             provider_registry: None,
+            agent_name: None,
+            agent_definition: None,
         }
     }
 }
@@ -426,20 +432,31 @@ pub async fn run_query_loop(
     // we don't loop forever on a model that can't finish within any budget.
     let mut max_tokens_recovery_count: u32 = 0;
     // Active model — may switch to fallback on overloaded errors.
-    let mut effective_model = config.model.clone();
+    // Agent model override takes priority over the session model when set.
+    let mut effective_model = if let Some(ref agent) = config.agent_definition {
+        agent.model.clone().unwrap_or_else(|| config.model.clone())
+    } else {
+        config.model.clone()
+    };
     let mut used_fallback = false;
+
+    // If an agent defines a max_turns override, respect it (agent wins over config).
+    let effective_max_turns = config.agent_definition
+        .as_ref()
+        .and_then(|a| a.max_turns)
+        .unwrap_or(config.max_turns);
 
     loop {
         turn += 1;
         tool_ctx
             .current_turn
             .store(turn as usize, std::sync::atomic::Ordering::Relaxed);
-        if turn > config.max_turns {
+        if turn > effective_max_turns {
             info!(turns = turn, "Max turns reached");
             if let Some(ref tx) = event_tx {
                 let _ = tx.send(QueryEvent::Status(format!(
                     "Reached maximum turn limit ({})",
-                    config.max_turns
+                    effective_max_turns
                 )));
             }
             // Return the last assistant message if any
@@ -517,22 +534,36 @@ pub async fn run_query_loop(
 
         // Verification nudge: if there are incomplete todos for this session
         // and the conversation has more than 2 turns, append a reminder.
-        let system = if turn > 2 {
-            let nudge = build_todo_nudge(&tool_ctx.session_id);
-            if nudge.is_empty() {
-                build_system_prompt(config)
-            } else {
-                let mut patched = config.clone();
-                patched.append_system_prompt = Some(match &config.append_system_prompt {
-                    Some(existing) => format!("{}\n\n{}", existing, nudge),
-                    None => nudge,
-                });
-                build_system_prompt(&patched)
+        let system = {
+            // Build a (possibly patched) config for system-prompt assembly.
+            // Agent prompt prefix and todo nudge are both applied here.
+            let mut patched = config.clone();
+
+            // Apply agent system-prompt prefix: prepend before the main system prompt.
+            if let Some(ref agent) = config.agent_definition {
+                if let Some(ref agent_prompt) = agent.prompt {
+                    patched.system_prompt = Some(match &config.system_prompt {
+                        Some(existing) => format!("{}\n\n{}", agent_prompt, existing),
+                        None => agent_prompt.clone(),
+                    });
+                }
             }
-        } else {
-            build_system_prompt(config)
+
+            // Apply todo nudge on turns > 2.
+            if turn > 2 {
+                let nudge = build_todo_nudge(&tool_ctx.session_id);
+                if !nudge.is_empty() {
+                    patched.append_system_prompt = Some(match &config.append_system_prompt {
+                        Some(existing) => format!("{}\n\n{}", existing, nudge),
+                        None => nudge,
+                    });
+                }
+            }
+
+            build_system_prompt(&patched)
         };
 
+        let system_for_provider = system.clone(); // used by non-Anthropic dispatch below
         let mut req_builder = CreateMessageRequest::builder(&effective_model, config.max_tokens)
             .messages(api_messages)
             .system(system)
@@ -551,10 +582,17 @@ pub async fn run_query_loop(
             req_builder = req_builder.thinking(ThinkingConfig::enabled(budget));
         }
 
-        // Apply temperature: explicit config value takes precedence, then effort-level override.
-        let effective_temperature = config.temperature.or_else(|| {
-            config.effort_level.and_then(|el| el.temperature())
-        });
+        // Apply temperature: explicit config value takes precedence, then agent override,
+        // then effort-level override.
+        let effective_temperature = config.temperature
+            .or_else(|| {
+                config.agent_definition.as_ref()
+                    .and_then(|a| a.temperature)
+                    .map(|t| t as f32)
+            })
+            .or_else(|| {
+                config.effort_level.and_then(|el| el.temperature())
+            });
         if let Some(t) = effective_temperature {
             req_builder = req_builder.temperature(t);
         }
@@ -569,38 +607,206 @@ pub async fn run_query_loop(
             Arc::new(claurst_api::streaming::NullStreamHandler)
         };
 
-        // If a non-Anthropic provider is selected and the registry has it,
-        // dispatch through the registry's LlmProvider rather than the
-        // AnthropicClient.  The Anthropic path below remains unchanged.
-        //
-        // TODO(Phase 4 follow-up): replace this branch with a full streaming
-        // implementation once the unified StreamEvent → AnthropicStreamEvent
-        // bridge is built.  Currently we fall through to the Anthropic path
-        // even when a registry provider is found, because the inner loop
-        // uses AnthropicStreamEvent and StreamAccumulator which are Anthropic-
-        // specific.  The registry hook here establishes the dispatch point so
-        // the wiring can be completed incrementally.
+        // Non-Anthropic provider dispatch: if the model is "provider/model"
+        // format and the registry has that provider, use it directly.
         if let Some(ref registry) = config.provider_registry {
-            let provider_id_str = effective_model
-                .split('/')
-                .next()
-                .unwrap_or("anthropic");
-            // Check if an explicit non-anthropic provider is configured.
-            // The model field may be "provider/model-id" or just "model-id".
-            // We consult the registry only when the provider is explicitly
-            // non-Anthropic and has a registered entry.
-            let maybe_provider_id = claurst_core::provider_id::ProviderId::new(provider_id_str);
-            if provider_id_str != "anthropic" && registry.get(&maybe_provider_id).is_some() {
-                // TODO: Implement full dispatch through registry provider.
-                // The provider is available via registry.get(&maybe_provider_id).
-                // Call provider.create_message(ProviderRequest { ... }).await
-                // and convert the ProviderResponse back to a Message + UsageInfo.
-                // For now we log a warning and fall through to the Anthropic path.
-                warn!(
-                    provider = %provider_id_str,
-                    model = %effective_model,
-                    "Non-Anthropic provider found in registry — full dispatch pending (Phase 4 follow-up)"
-                );
+            // Parse "provider/model" or fall back to config.provider
+            let (provider_id_str, model_id_str) = if let Some((p, m)) = effective_model.split_once('/') {
+                (p, m)
+            } else {
+                let p = tool_ctx.config.provider.as_deref().unwrap_or("anthropic");
+                (p, effective_model.as_str())
+            };
+
+            if provider_id_str != "anthropic" {
+                let pid = claurst_core::provider_id::ProviderId::new(provider_id_str);
+                if let Some(provider) = registry.get(&pid) {
+                    debug!(provider = %provider_id_str, model = %model_id_str, "Dispatching to non-Anthropic provider");
+
+                    // Notify TUI that we're calling the provider
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx.send(QueryEvent::Status(format!("Calling {} ({})…", provider.name(), model_id_str)));
+                    }
+
+                    // Build ProviderRequest from the already-assembled request data.
+                    // tools comes from the api_tools we already built above.
+                    let provider_tools: Vec<claurst_core::types::ToolDefinition> = tools
+                        .iter()
+                        .map(|t| t.to_definition())
+                        .collect();
+                    let provider_request = claurst_api::ProviderRequest {
+                        model: model_id_str.to_owned(),
+                        messages: messages.clone(),
+                        system_prompt: Some(system_for_provider.clone()),
+                        tools: provider_tools,
+                        max_tokens: config.max_tokens,
+                        temperature: effective_temperature.map(|t| t as f64),
+                        top_p: None,
+                        top_k: None,
+                        stop_sequences: vec![],
+                        thinking: effective_thinking_budget.map(|b| claurst_api::ThinkingConfig::enabled(b)),
+                        provider_options: serde_json::Value::Null,
+                    };
+
+                    // Use create_message_stream so the TUI receives real-time
+                    // text deltas instead of waiting for the full response.
+                    let mut stream = match provider.create_message_stream(provider_request).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            error!(provider = %provider_id_str, error = %e, "Provider stream failed");
+                            return QueryOutcome::Error(
+                                claurst_core::error::ClaudeError::Api(e.to_string())
+                            );
+                        }
+                    };
+
+                    // Accumulators for building the final assistant message.
+                    let mut text_chunks: Vec<String> = Vec::new();
+                    // tool_call_blocks: index → (id, name, accumulated_json)
+                    let mut tool_call_blocks: std::collections::HashMap<usize, (String, String, String)> =
+                        std::collections::HashMap::new();
+                    let mut usage = UsageInfo::default();
+                    let mut stop_str = "end_turn".to_string();
+                    let mut msg_id = uuid::Uuid::new_v4().to_string();
+
+                    use futures::StreamExt as ProviderStreamExt;
+                    loop {
+                        tokio::select! {
+                            _ = cancel_token.cancelled() => {
+                                return QueryOutcome::Cancelled;
+                            }
+                            event = stream.next() => {
+                                match event {
+                                    None => break,
+                                    Some(Err(e)) => {
+                                        error!(provider = %provider_id_str, error = %e, "Provider stream error");
+                                        break;
+                                    }
+                                    Some(Ok(evt)) => {
+                                        // Forward to TUI via AnthropicStreamEvent mapping.
+                                        if let Some(ref tx) = event_tx {
+                                            if let Some(ae) = map_to_anthropic_event(&evt) {
+                                                let _ = tx.send(QueryEvent::Stream(ae));
+                                            }
+                                        }
+
+                                        // Accumulate response data.
+                                        match &evt {
+                                            claurst_api::StreamEvent::MessageStart { id, usage: u, .. } => {
+                                                msg_id = id.clone();
+                                                usage.input_tokens = u.input_tokens;
+                                                usage.cache_read_input_tokens = u.cache_read_input_tokens;
+                                                usage.cache_creation_input_tokens = u.cache_creation_input_tokens;
+                                            }
+                                            claurst_api::StreamEvent::ContentBlockStart { index, content_block } => {
+                                                if let ContentBlock::ToolUse { id, name, .. } = content_block {
+                                                    tool_call_blocks.insert(*index, (id.clone(), name.clone(), String::new()));
+                                                }
+                                            }
+                                            claurst_api::StreamEvent::TextDelta { text, .. } => {
+                                                text_chunks.push(text.clone());
+                                            }
+                                            claurst_api::StreamEvent::InputJsonDelta { index, partial_json } => {
+                                                if let Some((_, _, buf)) = tool_call_blocks.get_mut(index) {
+                                                    buf.push_str(partial_json);
+                                                }
+                                            }
+                                            claurst_api::StreamEvent::MessageDelta { stop_reason, usage: u } => {
+                                                stop_str = match stop_reason {
+                                                    Some(claurst_api::provider_types::StopReason::ToolUse) => "tool_use",
+                                                    Some(claurst_api::provider_types::StopReason::MaxTokens) => "max_tokens",
+                                                    _ => "end_turn",
+                                                }.to_string();
+                                                if let Some(u) = u {
+                                                    usage.output_tokens = u.output_tokens;
+                                                }
+                                            }
+                                            claurst_api::StreamEvent::MessageStop => break,
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Build the content blocks from accumulated stream data.
+                    let mut content_blocks: Vec<ContentBlock> = Vec::new();
+
+                    let combined_text = text_chunks.join("");
+                    if !combined_text.is_empty() {
+                        content_blocks.push(ContentBlock::Text { text: combined_text });
+                    }
+
+                    // Reconstruct tool-use blocks (sorted by index for determinism).
+                    let mut tc_indices: Vec<usize> = tool_call_blocks.keys().cloned().collect();
+                    tc_indices.sort();
+                    for idx in tc_indices {
+                        if let Some((id, name, json_str)) = tool_call_blocks.remove(&idx) {
+                            let input: serde_json::Value = serde_json::from_str(&json_str)
+                                .unwrap_or(serde_json::json!({}));
+                            content_blocks.push(ContentBlock::ToolUse { id, name, input });
+                        }
+                    }
+
+                    let assistant_msg = Message {
+                        role: claurst_core::types::Role::Assistant,
+                        content: claurst_core::types::MessageContent::Blocks(content_blocks.clone()),
+                        uuid: Some(msg_id),
+                        cost: None,
+                    };
+
+                    cost_tracker.add_usage(
+                        usage.input_tokens,
+                        usage.output_tokens,
+                        usage.cache_creation_input_tokens,
+                        usage.cache_read_input_tokens,
+                    );
+
+                    messages.push(assistant_msg.clone());
+
+                    // Handle tool-use turn: execute tools and loop.
+                    let tool_use_blocks: Vec<_> = content_blocks.iter().filter_map(|b| {
+                        if let ContentBlock::ToolUse { id, name, input } = b {
+                            Some((id.clone(), name.clone(), input.clone()))
+                        } else {
+                            None
+                        }
+                    }).collect();
+
+                    if !tool_use_blocks.is_empty() && stop_str == "tool_use" {
+                        let mut tool_results = Vec::new();
+                        for (tool_id, tool_name, tool_input) in tool_use_blocks {
+                            let result = execute_tool(&*tool_name, &tool_input, tools, &tool_ctx).await;
+                            tool_results.push(ContentBlock::ToolResult {
+                                tool_use_id: tool_id,
+                                content: claurst_core::types::ToolResultContent::Text(result.content),
+                                is_error: Some(result.is_error),
+                            });
+                        }
+                        messages.push(Message {
+                            role: claurst_core::types::Role::User,
+                            content: claurst_core::types::MessageContent::Blocks(tool_results),
+                            uuid: None,
+                            cost: None,
+                        });
+                        continue; // loop for next turn
+                    }
+
+                    // End turn — notify TUI and return.
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx.send(QueryEvent::TurnComplete {
+                            stop_reason: stop_str.clone(),
+                            turn,
+                            usage: Some(usage.clone()),
+                        });
+                    }
+
+                    return QueryOutcome::EndTurn {
+                        message: assistant_msg,
+                        usage,
+                    };
+                }
             }
         }
 
@@ -1282,6 +1488,92 @@ fn build_system_prompt(config: &QueryConfig) -> SystemPrompt {
 
     let text = claurst_core::system_prompt::build_system_prompt(&opts);
     SystemPrompt::Text(text)
+}
+
+// ---------------------------------------------------------------------------
+// Provider stream event mapping
+// ---------------------------------------------------------------------------
+
+/// Map a unified `StreamEvent` (from a non-Anthropic provider) onto the
+/// equivalent `AnthropicStreamEvent` so that the TUI stream consumer sees a
+/// single, consistent event type regardless of which provider produced it.
+fn map_to_anthropic_event(
+    evt: &claurst_api::StreamEvent,
+) -> Option<claurst_api::AnthropicStreamEvent> {
+    use claurst_api::streaming::{AnthropicStreamEvent, ContentDelta};
+    use claurst_api::StreamEvent;
+
+    match evt {
+        StreamEvent::MessageStart { id, model, usage } => {
+            Some(AnthropicStreamEvent::MessageStart {
+                id: id.clone(),
+                model: model.clone(),
+                usage: usage.clone(),
+            })
+        }
+        StreamEvent::ContentBlockStart { index, content_block } => {
+            Some(AnthropicStreamEvent::ContentBlockStart {
+                index: *index,
+                content_block: content_block.clone(),
+            })
+        }
+        StreamEvent::TextDelta { index, text } => {
+            Some(AnthropicStreamEvent::ContentBlockDelta {
+                index: *index,
+                delta: ContentDelta::TextDelta { text: text.clone() },
+            })
+        }
+        StreamEvent::ThinkingDelta { index, thinking } => {
+            Some(AnthropicStreamEvent::ContentBlockDelta {
+                index: *index,
+                delta: ContentDelta::ThinkingDelta { thinking: thinking.clone() },
+            })
+        }
+        StreamEvent::ReasoningDelta { index, reasoning } => {
+            Some(AnthropicStreamEvent::ContentBlockDelta {
+                index: *index,
+                delta: ContentDelta::ThinkingDelta { thinking: reasoning.clone() },
+            })
+        }
+        StreamEvent::InputJsonDelta { index, partial_json } => {
+            Some(AnthropicStreamEvent::ContentBlockDelta {
+                index: *index,
+                delta: ContentDelta::InputJsonDelta { partial_json: partial_json.clone() },
+            })
+        }
+        StreamEvent::SignatureDelta { index, signature } => {
+            Some(AnthropicStreamEvent::ContentBlockDelta {
+                index: *index,
+                delta: ContentDelta::SignatureDelta { signature: signature.clone() },
+            })
+        }
+        StreamEvent::ContentBlockStop { index } => {
+            Some(AnthropicStreamEvent::ContentBlockStop { index: *index })
+        }
+        StreamEvent::MessageDelta { stop_reason, usage } => {
+            // Convert the unified StopReason to the string form used by
+            // AnthropicStreamEvent::MessageDelta.
+            let stop_reason_str = stop_reason.as_ref().map(|r| match r {
+                claurst_api::provider_types::StopReason::ToolUse => "tool_use".to_string(),
+                claurst_api::provider_types::StopReason::MaxTokens => "max_tokens".to_string(),
+                claurst_api::provider_types::StopReason::StopSequence => "stop_sequence".to_string(),
+                claurst_api::provider_types::StopReason::EndTurn => "end_turn".to_string(),
+                claurst_api::provider_types::StopReason::ContentFiltered => "content_filtered".to_string(),
+                claurst_api::provider_types::StopReason::Other(s) => s.clone(),
+            });
+            Some(AnthropicStreamEvent::MessageDelta {
+                stop_reason: stop_reason_str,
+                usage: usage.clone(),
+            })
+        }
+        StreamEvent::MessageStop => Some(AnthropicStreamEvent::MessageStop),
+        StreamEvent::Error { error_type, message } => {
+            Some(AnthropicStreamEvent::Error {
+                error_type: error_type.clone(),
+                message: message.clone(),
+            })
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

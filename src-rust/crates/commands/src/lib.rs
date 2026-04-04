@@ -171,6 +171,8 @@ pub struct AdvisorCommand;
 pub struct InstallSlackAppCommand;
 pub struct UndoCommand;
 pub struct ProvidersCommand;
+pub struct AgentCommand;
+pub struct SearchCommand;
 pub struct NamedCommandAdapter {
     pub slash_name: &'static str,
     pub target_name: &'static str,
@@ -3812,19 +3814,48 @@ impl SlashCommand for SkillsCommand {
             }
         }
 
-        if found.is_empty() {
+        // Include discovered skills from .claude/skills/ and configured paths/URLs.
+        let discovered = claurst_core::discover_skills(
+            &ctx.working_dir,
+            &ctx.config.skills,
+        );
+
+        let mut output = if found.is_empty() && discovered.is_empty() {
             return CommandResult::Message(
                 "No skills found.\nCreate .md files in .claude/commands/ to define skills.\n\
                  Example: .claude/commands/review.md".to_string(),
             );
+        } else if found.is_empty() {
+            String::new()
+        } else {
+            found.sort();
+            format!(
+                "Available skills ({}):\n{}",
+                found.len(),
+                found.iter().map(|s| format!("  /{}", s)).collect::<Vec<_>>().join("\n")
+            )
+        };
+
+        if !discovered.is_empty() {
+            let mut disc_list: Vec<(&String, &claurst_core::DiscoveredSkill)> =
+                discovered.iter().collect();
+            disc_list.sort_by_key(|(name, _)| name.as_str());
+
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            output.push_str(&format!("\nDiscovered skills ({}):\n", disc_list.len()));
+            for (name, skill) in disc_list {
+                output.push_str(&format!(
+                    "  /{} — {} ({})\n",
+                    name,
+                    skill.description,
+                    skill.source_path.display()
+                ));
+            }
         }
 
-        found.sort();
-        CommandResult::Message(format!(
-            "Available skills ({}):\n{}",
-            found.len(),
-            found.iter().map(|s| format!("  /{}", s)).collect::<Vec<_>>().join("\n")
-        ))
+        CommandResult::Message(output.trim_end().to_string())
     }
 }
 
@@ -5253,13 +5284,13 @@ impl SlashCommand for UpgradeCommand {
                 return CommandResult::Message(format!(
                     "Current version: {current}\n\
                      Could not check for updates (HTTP client error: {e})\n\
-                     Visit https://github.com/anthropics/claude-code/releases for updates."
+                     Visit https://github.com/kuberwastaken/claurst/releases for updates."
                 ))
             }
         };
 
         let resp = client
-            .get("https://api.github.com/repos/anthropics/claude-code/releases/latest")
+            .get("https://api.github.com/repos/kuberwastaken/claurst/releases/latest")
             .send()
             .await;
 
@@ -5277,7 +5308,7 @@ impl SlashCommand for UpgradeCommand {
                 let url = json
                     .get("html_url")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("https://github.com/anthropics/claude-code/releases");
+                    .unwrap_or("https://github.com/kuberwastaken/claurst/releases");
 
                 if tag == current || tag == "unknown" {
                     CommandResult::Message(format!(
@@ -5302,13 +5333,13 @@ impl SlashCommand for UpgradeCommand {
                 CommandResult::Message(format!(
                     "Current version: v{current}\n\
                      Could not check for updates (HTTP {status}).\n\
-                     Visit https://github.com/anthropics/claude-code/releases for updates."
+                     Visit https://github.com/kuberwastaken/claurst/releases for updates."
                 ))
             }
             Err(e) => CommandResult::Message(format!(
                 "Current version: v{current}\n\
                  Could not check for updates: {e}\n\
-                 Visit https://github.com/anthropics/claude-code/releases for updates."
+                 Visit https://github.com/kuberwastaken/claurst/releases for updates."
             )),
         }
     }
@@ -5348,13 +5379,13 @@ impl SlashCommand for ReleaseNotesCommand {
             Err(_) => {
                 return CommandResult::Message(format!(
                     "Claurst {tag} release notes:\n\
-                     Visit https://github.com/anthropics/claude-code/releases/tag/{tag}"
+                     Visit https://github.com/kuberwastaken/claurst/releases/tag/{tag}"
                 ))
             }
         };
 
         let url = format!(
-            "https://api.github.com/repos/anthropics/claude-code/releases/tags/{}",
+            "https://api.github.com/repos/kuberwastaken/claurst/releases/tags/{}",
             tag
         );
 
@@ -5388,17 +5419,17 @@ impl SlashCommand for ReleaseNotesCommand {
             }
             Ok(r) if r.status().as_u16() == 404 => CommandResult::Message(format!(
                 "No release found for {tag}.\n\
-                 View all releases: https://github.com/anthropics/claude-code/releases"
+                 View all releases: https://github.com/kuberwastaken/claurst/releases"
             )),
             Ok(r) => CommandResult::Message(format!(
                 "Could not fetch release notes (HTTP {}).\n\
-                 View at: https://github.com/anthropics/claude-code/releases/tag/{}",
+                 View at: https://github.com/kuberwastaken/claurst/releases/tag/{}",
                 r.status(),
                 tag
             )),
             Err(e) => CommandResult::Message(format!(
                 "Could not fetch release notes: {e}\n\
-                 View at: https://github.com/anthropics/claude-code/releases/tag/{tag}"
+                 View at: https://github.com/kuberwastaken/claurst/releases/tag/{tag}"
             )),
         }
     }
@@ -6165,6 +6196,81 @@ impl SlashCommand for ColorSetCommand {
             )),
             Err(e) => CommandResult::Error(format!("Failed to save color: {}", e)),
         }
+    }
+}
+
+// ---- /search -------------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for SearchCommand {
+    fn name(&self) -> &str { "search" }
+    fn description(&self) -> &str { "Search across all sessions" }
+    fn help(&self) -> &str {
+        "Usage: /search <query>\n\n\
+         Searches session titles and message content in the local SQLite\n\
+         session database (~/.claude/sessions.db).  Returns the 50 best\n\
+         matching sessions, ordered by most recently updated.\n\n\
+         Example: /search refactor authentication"
+    }
+
+    async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        let query = args.trim();
+        if query.is_empty() {
+            return CommandResult::Error(
+                "Usage: /search <query>\n\
+                 Provide a search term to look up across all sessions."
+                    .to_string(),
+            );
+        }
+
+        let db_path = claurst_core::config::Settings::config_dir().join("sessions.db");
+
+        let store = match claurst_core::SqliteSessionStore::open(&db_path) {
+            Ok(s) => s,
+            Err(e) => {
+                return CommandResult::Error(format!(
+                    "Failed to open session database: {}\n\
+                     The database is created automatically once sessions are stored.",
+                    e
+                ))
+            }
+        };
+
+        let results = match store.search_sessions(query) {
+            Ok(r) => r,
+            Err(e) => {
+                return CommandResult::Error(format!(
+                    "Search failed: {}",
+                    e
+                ))
+            }
+        };
+
+        if results.is_empty() {
+            return CommandResult::Message(format!(
+                "No sessions found matching \"{}\".",
+                query
+            ));
+        }
+
+        let mut out = format!(
+            "Search results for \"{}\": {} session(s)\n\n",
+            query,
+            results.len()
+        );
+        for s in &results {
+            let title = s.title.as_deref().unwrap_or("(untitled)");
+            out.push_str(&format!(
+                "  [{}] {} — {} ({} messages, updated {})\n",
+                &s.id[..s.id.len().min(12)],
+                title,
+                s.model,
+                s.message_count,
+                &s.updated_at[..s.updated_at.len().min(10)],
+            ));
+        }
+        out.push_str("\nTip: use /resume <session-id> to continue a session.");
+        CommandResult::Message(out)
     }
 }
 
@@ -7329,6 +7435,82 @@ impl SlashCommand for ProvidersCommand {
     }
 }
 
+// ---- /agent ---------------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for AgentCommand {
+    fn name(&self) -> &str { "agent" }
+    fn description(&self) -> &str { "List available agents or get info about a specific agent" }
+    fn help(&self) -> &str {
+        "Usage: /agent [name]\n\nWithout arguments, lists all available named agents.\nWith a name, shows details for that agent.\n\nTo use an agent, start Claurst with: --agent <name>"
+    }
+
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        use std::collections::HashMap;
+
+        // Merge built-in defaults with user-defined agents (user wins on collision).
+        let mut all_agents: HashMap<String, claurst_core::AgentDefinition> =
+            claurst_core::default_agents();
+        all_agents.extend(ctx.config.agents.clone());
+
+        let agent_name = args.trim();
+
+        if agent_name.is_empty() {
+            // List all visible agents.
+            let mut keys: Vec<&String> = all_agents
+                .iter()
+                .filter(|(_, d)| d.visible)
+                .map(|(k, _)| k)
+                .collect();
+            keys.sort();
+
+            let mut output = "Available agents:\n\n".to_string();
+            for name in keys {
+                let def = &all_agents[name];
+                output.push_str(&format!(
+                    "  @{} — {}\n    access: {}{}\n",
+                    name,
+                    def.description.as_deref().unwrap_or(""),
+                    def.access,
+                    def.max_turns
+                        .map(|t| format!(", max_turns: {}", t))
+                        .unwrap_or_default(),
+                ));
+            }
+            output.push_str("\nUse --agent <name> when starting Claurst to activate an agent.");
+            CommandResult::Message(output)
+        } else if let Some(def) = all_agents.get(agent_name) {
+            // Show details for the named agent.
+            let mut output = format!("Agent: @{}\n", agent_name);
+            if let Some(ref desc) = def.description {
+                output.push_str(&format!("Description: {}\n", desc));
+            }
+            output.push_str(&format!("Access: {}\n", def.access));
+            if let Some(ref model) = def.model {
+                output.push_str(&format!("Model: {}\n", model));
+            }
+            if let Some(t) = def.max_turns {
+                output.push_str(&format!("Max turns: {}\n", t));
+            }
+            if let Some(ref color) = def.color {
+                output.push_str(&format!("Color: {}\n", color));
+            }
+            if let Some(ref prompt) = def.prompt {
+                output.push_str(&format!("\nSystem prompt prefix:\n  {}\n", prompt));
+            }
+            output.push_str(&format!(
+                "\nTo activate: claude --agent {}", agent_name
+            ));
+            CommandResult::Message(output)
+        } else {
+            CommandResult::Error(format!(
+                "Unknown agent '{}'. Run /agent to see available agents.",
+                agent_name
+            ))
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
@@ -7500,6 +7682,10 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(UndoCommand),
         // Multi-provider support
         Box::new(ProvidersCommand),
+        // Named agent system
+        Box::new(AgentCommand),
+        // Session search (SQLite)
+        Box::new(SearchCommand),
     ]
 }
 
@@ -7526,6 +7712,104 @@ pub fn build_help_entries() -> Vec<claurst_tui::overlays::HelpEntry> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// User-defined command templates (Feature 2)
+// ---------------------------------------------------------------------------
+
+/// A slash command backed by a user-defined template in `settings.json`.
+struct TemplateCommand {
+    name: String,
+    template: claurst_core::CommandTemplate,
+}
+
+#[async_trait]
+impl SlashCommand for TemplateCommand {
+    fn name(&self) -> &str { &self.name }
+    fn description(&self) -> &str {
+        self.template.description.as_deref().unwrap_or("Custom command")
+    }
+    async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        let mut words = args.split_whitespace();
+        let arg1 = words.next().unwrap_or("");
+        let arg2 = words.next().unwrap_or("");
+        let prompt = self.template.template
+            .replace("$ARGUMENTS", args)
+            .replace("$1", arg1)
+            .replace("$2", arg2);
+        CommandResult::UserMessage(prompt)
+    }
+}
+
+/// Build slash commands from user-defined command templates stored in
+/// `settings.commands`.
+pub fn commands_from_settings(settings: &claurst_core::Settings) -> Vec<Box<dyn SlashCommand>> {
+    settings.commands.iter().map(|(name, template)| {
+        Box::new(TemplateCommand {
+            name: name.clone(),
+            template: template.clone(),
+        }) as Box<dyn SlashCommand>
+    }).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Discovered skill commands (from .claude/skills/ and git URLs)
+// ---------------------------------------------------------------------------
+
+/// A slash command backed by a discovered skill markdown file.
+struct SkillCommand {
+    name: String,
+    description: String,
+    template: String,
+}
+
+#[async_trait]
+impl SlashCommand for SkillCommand {
+    fn name(&self) -> &str { &self.name }
+    fn description(&self) -> &str { &self.description }
+
+    async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        let mut words = args.split_whitespace();
+        let arg1 = words.next().unwrap_or("");
+        let arg2 = words.next().unwrap_or("");
+        let prompt = self.template
+            .replace("$ARGUMENTS", args)
+            .replace("$1", arg1)
+            .replace("$2", arg2);
+        CommandResult::UserMessage(prompt)
+    }
+}
+
+/// Build slash commands from skill markdown files discovered on the filesystem
+/// and from configured git URLs.
+///
+/// Pass the project `cwd` and the `skills` section of the effective config.
+/// Bundled skills take precedence — any discovered skill whose name clashes
+/// with a built-in command will be silently skipped.
+pub fn commands_from_discovered_skills(
+    cwd: &std::path::Path,
+    skills_config: &claurst_core::SkillsConfig,
+) -> Vec<Box<dyn SlashCommand>> {
+    let discovered = claurst_core::discover_skills(cwd, skills_config);
+    // Build a set of built-in command names so we can skip collisions.
+    let all_cmds = all_commands();
+    let builtin_names: std::collections::HashSet<&str> = all_cmds
+        .iter()
+        .map(|c| c.name())
+        .collect();
+
+    discovered
+        .into_values()
+        .filter(|skill| !builtin_names.contains(skill.name.as_str()))
+        .map(|skill| {
+            Box::new(SkillCommand {
+                name: skill.name,
+                description: skill.description,
+                template: skill.template,
+            }) as Box<dyn SlashCommand>
+        })
+        .collect()
+}
+
 /// Execute a slash command string (with leading /).
 pub async fn execute_command(
     input: &str,
@@ -7539,10 +7823,29 @@ pub async fn execute_command(
         return Some(cmd.execute(args, ctx).await);
     }
 
+    // Check user-defined command templates from settings.
+    let cmd_name = name.trim_start_matches('/');
+    if let Some(tmpl) = ctx.config.commands.get(cmd_name).cloned() {
+        let tc = TemplateCommand { name: cmd_name.to_string(), template: tmpl };
+        return Some(tc.execute(args, ctx).await);
+    }
+
+    // Check discovered skill commands (from .claude/skills/, git URLs, etc.).
+    {
+        let discovered = claurst_core::discover_skills(&ctx.working_dir, &ctx.config.skills);
+        if let Some(skill) = discovered.get(cmd_name) {
+            let sc = SkillCommand {
+                name: skill.name.clone(),
+                description: skill.description.clone(),
+                template: skill.template.clone(),
+            };
+            return Some(sc.execute(args, ctx).await);
+        }
+    }
+
     // Then check plugin-defined slash commands.
     let project_dir = ctx.working_dir.clone();
     let registry = claurst_plugins::load_plugins(&project_dir, &[]).await;
-    let cmd_name = name.trim_start_matches('/');
     for cmd_def in registry.all_command_defs() {
         if cmd_def.name == cmd_name {
             let adapter = PluginSlashCommandAdapter { def: cmd_def };

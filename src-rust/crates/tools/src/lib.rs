@@ -17,6 +17,7 @@ use std::sync::Arc;
 // Sub-modules – each contains a full tool implementation.
 pub mod ask_user;
 pub mod bash;
+pub mod pty_bash;
 pub mod brief;
 pub mod config_tool;
 pub mod cron;
@@ -49,10 +50,13 @@ pub mod repl_tool;
 pub mod synthetic_output;
 pub mod team_tool;
 pub mod remote_trigger;
+pub mod formatter;
 
 // Re-exports for convenience.
+pub use formatter::try_format_file;
 pub use ask_user::AskUserQuestionTool;
 pub use bash::BashTool;
+pub use pty_bash::PtyBashTool;
 pub use brief::BriefTool;
 pub use config_tool::ConfigTool;
 pub use cron::{CronCreateTool, CronDeleteTool, CronListTool};
@@ -334,7 +338,7 @@ pub trait Tool: Send + Sync {
 /// Return all built-in tools (excluding AgentTool, which lives in cc-query).
 pub fn all_tools() -> Vec<Box<dyn Tool>> {
     vec![
-        Box::new(BashTool),
+        Box::new(PtyBashTool),
         Box::new(FileReadTool),
         Box::new(FileEditTool),
         Box::new(FileWriteTool),
@@ -575,7 +579,7 @@ mod tests {
 
     #[test]
     fn test_bash_tool_permission_level() {
-        assert_eq!(BashTool.permission_level(), PermissionLevel::Execute);
+        assert_eq!(PtyBashTool.permission_level(), PermissionLevel::Execute);
     }
 
     #[test]
@@ -597,7 +601,7 @@ mod tests {
 
     #[test]
     fn test_tool_to_definition() {
-        let def = BashTool.to_definition();
+        let def = PtyBashTool.to_definition();
         assert_eq!(def.name, "Bash");
         assert!(!def.description.is_empty());
         assert!(def.input_schema.is_object());
